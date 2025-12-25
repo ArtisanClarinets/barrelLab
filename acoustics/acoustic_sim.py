@@ -2,108 +2,96 @@ import streamlit as st
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.signal import find_peaks
-from pydub import AudioSegment
-from pydub.generators import Sine
-import tempfile
-import os
 import logging
 import sys
+import os
 
-# Add backend to path to import gpu_compute
+# Add backend to path
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 try:
-    from backend.gpu import gpu_compute
+    from backend.physics import PhysicsEngine
 except ImportError:
-    gpu_compute = None
+    st.error("Could not import Physics Engine.")
+    PhysicsEngine = None
 
-# Configure logger
 logger = logging.getLogger(__name__)
 
 def render():
-    st.subheader("Acoustic Simulation Suite")
+    st.subheader("Acoustic Simulation Suite (TMM)")
 
-    # Tooltip and help dictionary
-    tooltips = {
-        "freq_analysis": "Calculates how sound waves of different frequencies resonate in your barrel shape.",
-        "time_analysis": "Simulates the note's start (attack), how it settles (decay), and how energy flows through the bore.",
-        "impedance": "A measure of how much the air column resists vibrations at each frequency.",
-        "peaks": "These are the frequencies your design most naturally resonates at (like notes it wants to play).",
-        "attack_env": "Shows how the sound 'starts' when you blow into the clarinet – fast, slow, strong, or soft.",
-        "export": "Generates a computer-simulated sound based on resonance peaks."
-    }
+    if not PhysicsEngine:
+        return
 
-    st.markdown("### Frequency Domain Analysis ℹ️")
-    st.caption(tooltips["freq_analysis"])
+    # Initialize Engine
+    engine = PhysicsEngine(use_gpu=True)
 
-    # Simulated impedance curve
-    freqs = np.linspace(100, 2000, 800)
+    # Get Profile
+    profile = st.session_state.bore_profile
 
-    # Try to use GPU compute if available for impedance calculation
-    # We create a dummy bore for the GPU function (length, radius)
-    # The GPU function calculates "sum of z*r" which is just a dummy calc in this codebase
-    # but we should use it to show integration.
-    if gpu_compute:
-        # Mock bore
-        L = np.ones(100)
-        R = np.ones(100)
-        gpu_result = gpu_compute.gpu_accelerated_impedance(L, R)
-        if gpu_result is not None:
-             st.success(f"GPU Accelerated Calculation Check: {gpu_result} (dummy value)")
+    # Simulation Parameters
+    col1, col2 = st.columns(2)
+    with col1:
+        temp = st.slider("Temperature (°C)", 0.0, 40.0, 20.0)
+    with col2:
+        max_freq = st.number_input("Max Frequency (Hz)", 1000, 5000, 2500)
 
-    impedance = 1 / (np.abs(np.sin(freqs / 250)) + 0.2)
-    peaks, _ = find_peaks(impedance, distance=40)
+    if st.button("Run Simulation"):
+        with st.spinner("Calculating Impedance Spectrum..."):
+            # Compute
+            freqs, Z_mag = engine.compute_impedance_curve(
+                bore_profile=profile,
+                freq_range=(50, max_freq),
+                freq_step=2.0,
+                temperature=temp
+            )
 
-    fig, ax = plt.subplots()
-    ax.plot(freqs, impedance, label="Impedance Curve")
-    ax.plot(freqs[peaks], impedance[peaks], "x", label="Resonance Peaks")
-    ax.set_xlabel("Frequency (Hz)")
-    ax.set_ylabel("Impedance (a.u.)")
-    ax.set_title("Impedance vs Frequency")
-    ax.legend()
-    st.pyplot(fig)
-    st.caption(tooltips["impedance"])
-    logger.debug(f"Simulated impedance curve with {len(peaks)} peaks.")
+            # Find Peaks
+            peaks_idx, _ = find_peaks(Z_mag, height=np.mean(Z_mag), distance=10)
+            peak_freqs = freqs[peaks_idx]
+            peak_mags = Z_mag[peaks_idx]
 
-    # Display resonance frequencies
-    st.markdown("**Detected Resonance Frequencies (Hz):**")
-    st.write(np.round(freqs[peaks], 1).tolist())
-    st.caption(tooltips["peaks"])
+            # Store last result in session?
+            st.session_state.last_sim_results = {
+                "freqs": freqs,
+                "impedance": Z_mag,
+                "peaks": peak_freqs
+            }
 
-    # Time domain simulation
-    st.markdown("### Time Domain Transient ℹ️")
-    st.caption(tooltips["time_analysis"])
+            # Plot
+            fig, ax = plt.subplots(figsize=(10, 4))
+            ax.plot(freqs, Z_mag, label="Input Impedance |Z|")
+            ax.plot(peak_freqs, peak_mags, "rx", label="Resonances")
+            ax.set_xlabel("Frequency (Hz)")
+            ax.set_ylabel("Impedance Magnitude (Ω)")
+            ax.set_title("Bore Input Impedance")
+            ax.grid(True, which='both', alpha=0.3)
+            ax.legend()
+            st.pyplot(fig)
 
-    time = np.linspace(0, 0.5, 500)
-    attack = np.exp(-15 * time) * np.sin(2 * np.pi * 440 * time)
-    fig2, ax2 = plt.subplots()
-    ax2.plot(time, attack)
-    ax2.set_xlabel("Time (s)")
-    ax2.set_ylabel("Amplitude")
-    ax2.set_title("Note Attack Envelope")
-    st.pyplot(fig2)
-    st.caption(tooltips["attack_env"])
-    logger.debug("Displayed note attack envelope (time domain response).")
+            # Analysis
+            st.markdown("### Resonance Analysis")
+            cols = st.columns(len(peak_freqs) if len(peak_freqs) < 6 else 4)
+            for i, f in enumerate(peak_freqs[:8]): # Show top 8
+                cols[i%4].metric(f"Mode {i+1}", f"{f:.1f} Hz")
 
-    # MP3 synthesis and export
-    st.markdown("### MP3 Sound Export ℹ️")
-    st.caption(tooltips["export"])
+            if len(peak_freqs) > 0:
+                fundamental = peak_freqs[0]
+                st.info(f"Fundamental Frequency: **{fundamental:.2f} Hz**")
 
-    # Simulate pure tone from first peak (if exists)
-    if len(peaks) > 0:
-        f = int(freqs[peaks[0]])
-    else:
-        f = 440
+                # Deviation from A4 (440) or target
+                target = st.session_state.target_freq
+                cents = 1200 * np.log2(fundamental / target)
+                st.metric("Tuning (Cents relative to Target)", f"{cents:.1f}", delta_color="inverse")
 
-    tone = Sine(f).to_audio_segment(duration=1000).apply_gain(-3.0)
-
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmpfile:
-        tone.export(tmpfile.name, format="mp3")
-        with open(tmpfile.name, "rb") as audio_file:
-            st.download_button("Download MP3", audio_file, file_name="simulated_sound.mp3", mime="audio/mpeg")
-        logger.info(f"Exported MP3 for frequency {f} Hz to {tmpfile.name}")
-        # Need to be careful with unlink on Windows, but fine here.
-        # However, streamlit button needs the data, we already read it into memory.
-        os.unlink(tmpfile.name)
-
-if __name__ == "__main__":
-    render()
+    elif "last_sim_results" in st.session_state:
+        # Re-render last result if exists
+        res = st.session_state.last_sim_results
+        fig, ax = plt.subplots(figsize=(10, 4))
+        ax.plot(res["freqs"], res["impedance"], label="Input Impedance |Z|")
+        ax.plot(res["peaks"], res["impedance"][np.isin(res["freqs"], res["peaks"])], "rx") # Simplified matching
+        # Note: recovering exact peak height for simple replot might be tricky if not stored,
+        # but good enough for UI persistence.
+        ax.set_xlabel("Frequency (Hz)")
+        ax.set_ylabel("Impedance Magnitude")
+        ax.grid(True)
+        st.pyplot(fig)

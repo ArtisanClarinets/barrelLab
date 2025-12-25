@@ -2,53 +2,81 @@ import streamlit as st
 import plotly.graph_objects as go
 import logging
 
-# Configure logging
 logger = logging.getLogger(__name__)
 
 def render():
     st.subheader("2D Bore Cross-Section Editor")
 
-    # Placeholder draggable control points
-    if "control_points" not in st.session_state:
-        st.session_state.control_points = [(0, 10), (30, 8), (60, 10)]
-    logger.debug(f"Initial control points: {st.session_state.control_points}")
+    # Load from session state
+    points = st.session_state.bore_profile
 
-    # We need to handle updates if this was interactive,
-    # but Streamlit's standard plotly chart isn't fully bi-directional for dragging out-of-the-box
-    # without specific components or callbacks.
-    # For now, we render what we have.
+    # Sort by X to ensure validity
+    points.sort(key=lambda p: p[0])
 
-    x_vals, y_vals = zip(*st.session_state.control_points)
+    # Unpack
+    x_vals = [p[0] for p in points]
+    y_vals = [p[1] for p in points]
 
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=x_vals, y=y_vals, mode='markers+lines', name="Bore Profile"))
+    fig.add_trace(go.Scatter(
+        x=x_vals,
+        y=y_vals,
+        mode='markers+lines',
+        name="Bore Profile",
+        line=dict(shape='spline', smoothing=0.3)
+    ))
 
     fig.update_layout(
-        dragmode='drawopenpath', # This allows drawing but capturing it back to streamlit requires work
-        title="Drag points to edit bore profile",
+        title="Current Profile",
         xaxis_title="Length (mm)",
         yaxis_title="Radius (mm)",
-        height=400
+        height=400,
+        hovermode="x"
     )
 
-    # Using 'streamlit-plotly-events' or similar would be needed for real interactivity,
-    # but sticking to standard libraries provided.
     st.plotly_chart(fig, use_container_width=True)
 
-    st.warning("⚠️ Dragging in the chart above does not update the backend state in this version. Use the inputs below to modify points.")
+    st.markdown("### Edit Points")
+    st.caption("Adjust the geometry points below. Click 'Update Profile' to save.")
 
-    # Add manual editors
-    new_points = []
-    cols = st.columns(len(st.session_state.control_points))
-    for i, (x, y) in enumerate(st.session_state.control_points):
-        with cols[i]:
-            new_x = st.number_input(f"X{i}", value=float(x), key=f"x_{i}")
-            new_y = st.number_input(f"R{i}", value=float(y), key=f"y_{i}")
-            new_points.append((new_x, new_y))
+    # Dynamic form for points
+    # We allow adding/removing points in a somewhat manual way for robustness
 
-    if new_points != st.session_state.control_points:
-        st.session_state.control_points = new_points
+    with st.form("bore_edit_form"):
+        col_list = st.columns(3)
+        new_points = []
+
+        # Display existing points
+        for i, (x, r) in enumerate(points):
+            with col_list[i % 3]:
+                st.markdown(f"**Point {i+1}**")
+                new_x = st.number_input(f"X (mm)", value=float(x), key=f"bx_{i}", min_value=0.0, max_value=200.0)
+                new_r = st.number_input(f"Radius (mm)", value=float(r), key=f"br_{i}", min_value=1.0, max_value=30.0)
+                new_points.append((new_x, new_r))
+
+        # Add new point option
+        st.markdown("---")
+        add_point = st.checkbox("Add a new point at end?")
+
+        submitted = st.form_submit_button("Update Profile")
+
+        if submitted:
+            if add_point:
+                last_x = new_points[-1][0]
+                new_points.append((last_x + 10.0, new_points[-1][1]))
+
+            # Sort and Save
+            new_points.sort(key=lambda p: p[0])
+            st.session_state.bore_profile = new_points
+            st.success("Profile updated!")
+            st.rerun()
+
+    # Reset
+    if st.button("Reset to Standard 66mm"):
+        st.session_state.bore_profile = [
+            (0.0, 15.0),
+            (20.0, 14.8),
+            (40.0, 14.8),
+            (66.0, 14.6)
+        ]
         st.rerun()
-
-if __name__ == "__main__":
-    render()

@@ -1,67 +1,117 @@
 import streamlit as st
 import numpy as np
+from scipy.optimize import minimize
 import logging
+import sys
+import os
 
-# Logging
+# Add backend to path
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+try:
+    from backend.physics import PhysicsEngine
+except ImportError:
+    PhysicsEngine = None
+
 logger = logging.getLogger(__name__)
 
 def render():
-    st.subheader("AI Design Assistant")
+    st.subheader("AI Design Assistant & Optimizer")
 
-    # Target frequency input
-    target_freq = st.slider("Target Fundamental Frequency (Hz)", 100, 2000, 440)
-    st.caption("🎯 We'll suggest bore tweaks to match this frequency more accurately.")
+    if not PhysicsEngine:
+        st.error("Physics Engine Unavailable.")
+        return
 
-    # Style preference slider
-    style = st.select_slider("Design Style Preference", options=["Historical", "Orchestral", "Jazz", "Experimental"])
-    st.caption("🎼 This helps the assistant shape the bore to match common tonal goals in different playing styles.")
+    st.markdown("""
+    This tool uses numerical optimization to adjust the bore profile to match a target fundamental frequency.
+    It simulates the acoustic response iteratively to find the optimal geometry.
+    """)
 
-    # Manufacturability constraints
-    min_wall = st.slider("Minimum Wall Thickness Allowed (mm)", 0.5, 5.0, 1.0)
-    st.caption("🛠️ Ensures the AI doesn't suggest geometries too thin to drill or print.")
+    # Targets
+    target_f = st.number_input("Target Frequency (Hz)", value=st.session_state.target_freq)
+    st.session_state.target_freq = target_f
 
-    # Simulated input data (mocked for prototype)
-    length_mm = 60
-    radius_profile = np.linspace(7.0, 7.4, 60)  # simulate radius profile
-    bore_volume = np.pi * np.mean(radius_profile)**2 * length_mm
+    # Constraints
+    max_iter = st.slider("Max Iterations", 10, 100, 30)
 
-    # AI Suggestion Logic (placeholder rules)
-    predicted_freq = 343 / (2 * length_mm / 1000)
-    deviation = abs(predicted_freq - target_freq)
+    if st.button("Auto-Optimize Bore"):
+        if "bore_profile" not in st.session_state:
+            st.error("No bore profile found.")
+            return
 
-    if deviation > 20:
-        suggestion = "Try lengthening the bore by 3–5mm or increasing mid-radius slightly."
-    elif deviation > 5:
-        suggestion = "Minor tuning needed – small adjustment to end taper radius."
-    else:
-        suggestion = "Design closely matches target frequency. Good job!"
+        current_profile = st.session_state.bore_profile
+        # We optimize the radii of the middle points.
+        # Fixed points: Top (0) and Bottom (last). Or allow all to move?
+        # Usually Tenon dimensions are fixed.
+        # Let's optimize radii of indices 1 to N-1.
 
-    # Defect predictions
-    crack_risk = "Low" if min_wall > 1.5 else "Moderate"
-    intonation_risk = "Minimal" if deviation < 10 else "Possible Issues"
+        # Flatten parameters: radii of intermediate points
+        # If we only have start/end, we can't do much.
+        if len(current_profile) < 3:
+            st.warning("Add more control points in the Geometry Editor to allow for optimization.")
+            return
 
-    # Material suggestion logic
-    material_rec = {
-        "Historical": "Boxwood",
-        "Orchestral": "Grenadilla",
-        "Jazz": "Cocobolo",
-        "Experimental": "Maple"
-    }.get(style, "Grenadilla")
+        # Optimization Setup
+        fixed_indices = [0, len(current_profile)-1] # Keep ends fixed
+        optim_indices = [i for i in range(len(current_profile)) if i not in fixed_indices]
 
-    # Display AI output
-    st.markdown("### Optimization Result")
-    st.write(f"Predicted Frequency: {predicted_freq:.1f} Hz")
-    st.write(f"Deviation from Target: {deviation:.1f} Hz")
-    st.success(suggestion)
+        initial_radii = np.array([current_profile[i][1] for i in optim_indices])
 
-    st.markdown("### Design Risk Predictions")
-    st.write(f"⚠️ Cracking Risk: **{crack_risk}**")
-    st.write(f"⚠️ Intonation Stability: **{intonation_risk}**")
+        engine = PhysicsEngine(use_gpu=False) # Use CPU for small loop overhead or if GPU is busy
 
-    st.markdown("### Recommended Material")
-    st.info(f"🎋 Suggested Wood: **{material_rec}** based on your tonal goals.")
+        status_text = st.empty()
+        progress_bar = st.progress(0)
 
-    logger.info(f"Target: {target_freq}, Predicted: {predicted_freq}, Style: {style}, Suggestion: {suggestion}")
+        def objective_function(radii):
+            # Construct candidate profile
+            candidate = current_profile.copy()
+            for i, idx in enumerate(optim_indices):
+                candidate[idx] = (candidate[idx][0], radii[i])
 
-if __name__ == "__main__":
-    render()
+            # Run Sim
+            # Focus on range near target to save time
+            f_min = target_f * 0.8
+            f_max = target_f * 1.2
+            freqs, Z = engine.compute_impedance_curve(candidate, freq_range=(f_min, f_max), freq_step=1.0)
+
+            # Find max peak
+            peak_idx = np.argmax(Z)
+            f_peak = freqs[peak_idx]
+
+            error = (f_peak - target_f)**2
+            return error
+
+        # Run Optimization
+        status_text.text("Optimizing geometry...")
+
+        res = minimize(
+            objective_function,
+            initial_radii,
+            method='Nelder-Mead',
+            options={'maxiter': max_iter, 'xatol': 0.01}
+        )
+
+        progress_bar.progress(100)
+
+        if res.success or res.message:
+            st.success(f"Optimization Complete: {res.message}")
+            st.write(f"Final Error (Hz^2): {res.fun:.4f}")
+
+            # Update State
+            new_radii = res.x
+            new_profile = current_profile.copy()
+            for i, idx in enumerate(optim_indices):
+                new_profile[idx] = (new_profile[idx][0], new_radii[i])
+
+            st.session_state.bore_profile = new_profile
+
+            # Show diff
+            st.write("Optimized Radii:")
+            for i, idx in enumerate(optim_indices):
+                old_r = current_profile[idx][1]
+                new_r = new_radii[i]
+                st.write(f"Point {idx+1} (x={current_profile[idx][0]}): {old_r:.2f} -> **{new_r:.2f} mm**")
+
+            st.info("The Geometry Editor has been updated with the new profile.")
+
+        else:
+            st.error("Optimization failed.")
